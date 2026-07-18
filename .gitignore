@@ -1,0 +1,25 @@
+# Build
+/build/
+/cmake-build-*/
+*.o
+*.a
+*.so
+*.exe
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+/tmp/
+*.log
+*.sst
+CURRENT
+MANIFEST-*

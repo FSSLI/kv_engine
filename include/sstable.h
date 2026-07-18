@@ -1,0 +1,144 @@
+#pragma once
+
+#include <string>
+#include <vector>
+#include <memory>
+#include <unordered_map>
+#include <cstdint>
+#include <cstdio>
+#include "slice.h"
+#include "iterator.h"
+#include "status.h"
+#include <mutex>
+
+namespace kv {
+
+void EncodeFixed32(std::string* dst, uint32_t value);
+void EncodeFixed64(std::string* dst, uint64_t value);
+uint32_t DecodeFixed32(const char* ptr);
+uint64_t DecodeFixed64(const char* ptr);
+
+class SSTableBuilder {
+public:
+    explicit SSTableBuilder(const std::string& filename, 
+                            size_t block_size = 4096);
+    ~SSTableBuilder();
+
+    Status Add(const Slice& key, const Slice& value);
+    Status Finish(uint64_t* file_size);
+    uint64_t NumEntries() const { return num_entries_; }
+
+private:
+    Status FlushBlock();
+    Status WriteRaw(const std::string& data);
+
+    FILE* file_;
+    std::string filename_;
+    size_t block_size_;
+    std::string current_block_;
+    uint32_t current_block_entries_;
+    std::string first_key_;
+    std::string last_key_;
+    std::string index_block_;
+    uint32_t index_block_count_;
+    uint64_t num_entries_;
+    uint64_t data_size_;
+    uint64_t current_offset_;
+    bool finished_;
+
+    SSTableBuilder(const SSTableBuilder&) = delete;
+    SSTableBuilder& operator=(const SSTableBuilder&) = delete;
+};
+
+class SSTable {
+public:
+    static Status Open(const std::string& filename, 
+                       std::unique_ptr<SSTable>* table);
+
+    ~SSTable();
+
+    Status Get(const Slice& key, std::string* value) const;
+
+    // 嵌套类直接在类内声明继承 ::kv::Iterator
+    class Iterator : public ::kv::Iterator {
+    public:
+        explicit Iterator(const SSTable* table);
+        void Seek(const Slice& target) override;
+        void SeekToFirst() override;
+        void Next() override;
+        bool Valid() const override;
+        Slice key() const override;
+        Slice value() const override;
+    private:
+        Status LoadBlock(uint64_t offset, uint64_t size);
+        void SeekInBlock(const Slice& target);
+
+        const SSTable* table_;
+        std::string block_data_;
+        struct Entry {
+            Slice key;
+            Slice value;
+        };
+        std::vector<Entry> entries_;
+        size_t current_index_;
+        uint64_t current_block_offset_;
+        uint64_t current_block_size_;
+        bool valid_;
+    };
+
+    std::unique_ptr<Iterator> NewIterator() const;
+
+    uint64_t FileSize() const { return file_size_; }
+    uint64_t NumEntries() const { return num_entries_; }
+    Slice SmallestKey() const { return Slice(smallest_key_); }
+    Slice LargestKey() const { return Slice(largest_key_); }
+    const std::string& Filename() const { return filename_; }
+
+private:
+    struct IndexEntry {
+        std::string last_key;
+        uint64_t offset;
+        uint64_t size;
+    };
+
+    SSTable(FILE* file, const std::string& filename,
+            uint64_t file_size, uint64_t num_entries,
+            const std::string& smallest, const std::string& largest,
+            uint64_t index_offset, uint64_t index_size);
+
+    Status ReadAt(uint64_t offset, size_t size, std::string* result) const;
+    Status FindBlock(const Slice& key, uint64_t* offset, uint64_t* size) const;
+
+    FILE* file_;
+    std::string filename_;
+    uint64_t file_size_;
+    uint64_t num_entries_;
+    std::string smallest_key_;
+    std::string largest_key_;
+    uint64_t index_offset_;
+    uint64_t index_size_;
+    std::vector<IndexEntry> index_entries_;
+
+    SSTable(const SSTable&) = delete;
+    SSTable& operator=(const SSTable&) = delete;
+};
+
+class TableCache {
+public:
+    TableCache() = default;
+    ~TableCache() = default;
+
+    Status FindTable(uint64_t file_number, const std::string& dbname,
+                     std::shared_ptr<SSTable>* table);
+    void Evict(uint64_t file_number);
+    void Clear();
+
+private:
+    std::mutex mutex_;
+    std::unordered_map<uint64_t, std::weak_ptr<SSTable>> cache_;
+
+    TableCache(const TableCache&) = delete;
+    TableCache& operator=(const TableCache&) = delete;
+};
+
+} // namespace kv

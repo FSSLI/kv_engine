@@ -121,7 +121,11 @@ Status KVDB::Get(const std::string& key, std::string* value) {
                 Status s = table_cache_.FindTable(it->file_number, options_.dbname, &table);
                 if (!s.ok()) continue;
                 s = table->Get(key, value);
-                if (s.ok()) return Status::OK();
+                if (s.ok()) {
+                    // 修复：空 value 表示 Delete 标记
+                    if (value->empty()) return Status::NotFound("key deleted");
+                    return Status::OK();
+                }
                 if (!s.IsNotFound()) return s;
             }
         } else {
@@ -138,7 +142,11 @@ Status KVDB::Get(const std::string& key, std::string* value) {
                     Status s = table_cache_.FindTable(meta.file_number, options_.dbname, &table);
                     if (!s.ok()) return s;
                     s = table->Get(key, value);
-                    if (s.ok()) return Status::OK();
+                    if (s.ok()) {
+                        // 修复：空 value 表示 Delete 标记
+                        if (value->empty()) return Status::NotFound("key deleted");
+                        return Status::OK();
+                    }
                     if (!s.IsNotFound()) return s;
                     break;
                 }
@@ -263,16 +271,24 @@ Status KVDB::CompactManually() {
 
     std::string first_key, last_key;
     bool first = true;
+    std::string last_output_key;  // 新增：用于同一 key 多版本去重
+
     while (merge.Valid()) {
-        // Week 1 简化：空 value 视为 Delete，Compaction 时跳过
-        if (merge.value().size() > 0) {
-            Status s = builder.Add(merge.key(), merge.value());
-            if (!s.ok()) return s;
-            if (first) {
-                first_key = merge.key().ToString();
-                first = false;
+        std::string cur_key = merge.key().ToString();
+
+        // 修复：相同 key 只保留第一个（最新版本，因为 L0 的 iterator index 更小，先出堆）
+        if (cur_key != last_output_key) {
+            // Week 1 简化：空 value 视为 Delete，Compaction 时跳过
+            if (merge.value().size() > 0) {
+                Status s = builder.Add(merge.key(), merge.value());
+                if (!s.ok()) return s;
+                if (first) {
+                    first_key = cur_key;
+                    first = false;
+                }
+                last_key = cur_key;
             }
-            last_key = merge.key().ToString();
+            last_output_key = cur_key;
         }
         merge.Next();
     }

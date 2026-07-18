@@ -1,6 +1,7 @@
 #include "version_set.h"
 #include <cstdio>
 #include <cstring>
+#include <unistd.h>
 
 #ifdef KV_DEBUG
 #define DEBUG_LOG(fmt, ...) printf("[DEBUG] " fmt "\n", ##__VA_ARGS__)
@@ -32,7 +33,17 @@ Status VersionSet::ReadCurrentFile(std::string* manifest_name) {
     std::string current_file = dbname_ + "/" + kCurrentFileName;
     FILE* f = fopen(current_file.c_str(), "r");
     if (!f) {
-        return Status::NotFound("CURRENT file not found");
+        // 修复：检查是否存在 CURRENT.tmp（上次 rename 前崩溃残留）
+        std::string tmp_file = current_file + ".tmp";
+        FILE* tmp_f = fopen(tmp_file.c_str(), "r");
+        if (tmp_f) {
+            fclose(tmp_f);
+            rename(tmp_file.c_str(), current_file.c_str());
+            f = fopen(current_file.c_str(), "r");
+        }
+        if (!f) {
+            return Status::NotFound("CURRENT file not found");
+        }
     }
     char buf[256];
     if (fgets(buf, sizeof(buf), f) == nullptr) {
@@ -199,7 +210,15 @@ Status VersionSet::WriteSnapshot() {
         }
     }
 
-    fflush(f);
+    // 修复：必须 fsync 保证 manifest 落盘，否则崩溃后可能丢失 SSTable 引用
+    if (fflush(f) != 0) {
+        fclose(f);
+        return Status::IOError("manifest fflush failed");
+    }
+    if (fsync(fileno(f)) != 0) {
+        fclose(f);
+        return Status::IOError("manifest fsync failed");
+    }
     fclose(f);
 
     Status s = WriteCurrentFile(manifest_name);

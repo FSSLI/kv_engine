@@ -29,8 +29,13 @@ private:
 
     struct Compare {
         bool operator()(const HeapItem& a, const HeapItem& b) const {
-            // 最小堆：key 字典序大的优先级低（沉底）
-            return Slice(a.key).compare(Slice(b.key)) > 0;
+            int cmp = Slice(a.key).compare(Slice(b.key));
+            if (cmp != 0) {
+                // 最小堆：key 字典序大的优先级低（沉底）
+                return cmp > 0;
+            }
+            // key 相同时，index 小的优先级更高（L0 的 iterator 先加入，index 更小）
+            return a.index > b.index;
         }
     };
 

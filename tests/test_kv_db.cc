@@ -224,6 +224,77 @@ void TestCompactManually() {
     std::cout << "  PASS: manual compaction" << std::endl;
 }
 
+void TestDeleteAfterFlush() {
+    std::cout << "=== TestDeleteAfterFlush ===" << std::endl;
+    CleanUp();
+
+    KVDB::Options options;
+    options.dbname = kTestDir;
+    options.write_buffer_size = 1024 * 1024;
+
+    std::unique_ptr<KVDB> db;
+    Status s = KVDB::Open(options, &db);
+    assert(s.ok());
+
+    s = db->Put("key1", "value1");
+    assert(s.ok());
+
+    s = db->Delete("key1");
+    assert(s.ok());
+
+    // 强制刷盘，让 Delete 标记进入 SSTable
+    s = db->TEST_FlushMemTable();
+    assert(s.ok());
+
+    // 从 SSTable 读取，应返回 NotFound
+    std::string value;
+    s = db->Get("key1", &value);
+    assert(s.IsNotFound());
+
+    std::cout << "  PASS: delete after flush" << std::endl;
+}
+
+void TestCompactionDeduplication() {
+    std::cout << "=== TestCompactionDeduplication ===" << std::endl;
+    CleanUp();
+
+    KVDB::Options options;
+    options.dbname = kTestDir;
+    options.write_buffer_size = 512;  // 小 buffer，快速产生多个 L0 文件
+
+    std::unique_ptr<KVDB> db;
+    Status s = KVDB::Open(options, &db);
+    assert(s.ok());
+
+    // 写入 key1，然后覆盖，再覆盖
+    s = db->Put("key1", "v1");
+    assert(s.ok());
+    s = db->Put("key1", "v2");
+    assert(s.ok());
+    s = db->Put("key1", "v3");
+    assert(s.ok());
+
+    // 再写一些其他 key，触发自动 flush
+    for (int i = 0; i < 500; ++i) {
+        char key[32], value[64];
+        snprintf(key, sizeof(key), "key%04d", i);
+        memset(value, 'x', sizeof(value) - 1);
+        value[sizeof(value) - 1] = '\0';
+        db->Put(key, value);
+    }
+
+    // 手动 Compaction
+    s = db->CompactManually();
+    assert(s.ok());
+
+    // 验证 key1 只有最新版本 v3
+    std::string value;
+    s = db->Get("key1", &value);
+    assert(s.ok() && value == "v3");
+
+    std::cout << "  PASS: compaction deduplication" << std::endl;
+}
+
 int main() {
     std::cout << "KVDB Tests Starting..." << std::endl;
 
@@ -233,6 +304,8 @@ int main() {
     TestAutoFlush();
     TestRecover();
     TestCompactManually();
+    TestDeleteAfterFlush();
+    TestCompactionDeduplication();
 
     CleanUp();
     std::cout << "\nAll tests passed!" << std::endl;

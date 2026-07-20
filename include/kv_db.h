@@ -36,6 +36,11 @@ public:
     // 测试辅助:强制把当前 memtable 刷成 L0 SSTable,并等后台落盘完成
     Status TEST_FlushMemTable();
 
+    // 任务③测试辅助:等后台把手头所有活干完(imm_ 刷完 + 正在进行的 compaction 收尾)
+    Status TEST_WaitForBackground();
+    // 任务③测试辅助:查看某层当前的 SSTable 数量(用于断言自动 compaction 是否触发)
+    int TEST_NumLevelFiles(int level);
+
     Status CompactManually();
 
 private:
@@ -55,6 +60,21 @@ private:
     // imm → SSTable 纯 IO。前提:调用时不持锁;imm 只读。
     // file_number 由调用方(持锁时)提前分配,meta 为出参。
     Status WriteLevel0Table(SkipList* imm, uint64_t file_number, FileMetaData* meta);
+
+    // ===== Week 3 任务③:自动 Compaction =====
+    //
+    // L0 文件数达到 kL0CompactionTrigger 时,后台线程自动把所有 L0(加重叠 L1)
+    // 归并成一个 L1 文件 —— 就是 CompactManually 的自动化。
+    // 与 flush 共用一个后台线程,调度顺序:先刷 imm_(数据安全优先),再 compact。
+    //
+    // 调用前提:调用方已持 mutex_(*lock)。内部会在归并 IO 期间临时放锁,
+    // 让前台 Get/Put 正常跑;版本变更(AddFile/RemoveFile/删文件)重新持锁后原子提交。
+    // bg_compacting_ 标志:防止 CompactManually 与后台 compaction 撞车。
+    Status CompactL0ToL1Locked(std::unique_lock<std::mutex>* lock);
+    // 等待后台空闲(imm_ 为空且没有正在进行的 compaction)。前提:已持锁。
+    void WaitForIdleLocked(std::unique_lock<std::mutex>* lock);
+
+    static constexpr int kL0CompactionTrigger = 4;  // 对照 LevelDB config::kL0_CompactionTrigger
 
     Status OpenNewWAL();
 
@@ -77,6 +97,7 @@ private:
     std::condition_variable imm_done_cv_;   // 后台 → 前台:imm_ 已清空
     bool bg_exit_ = false;                  // 置位后后台干完手头的活就退出
     uint64_t imm_log_number_ = 0;           // imm_ 对应的旧 WAL 文件号(落盘后凭它删文件)
+    bool bg_compacting_ = false;            // 任务③:后台 compaction 进行中(前台手动 compact 要等它)
 
     std::unique_ptr<VersionSet> version_set_;
     // 注意声明顺序:block_cache_ 必须在 table_cache_ 之前。

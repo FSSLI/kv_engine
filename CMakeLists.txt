@@ -68,3 +68,9 @@ add_test(NAME merging_iterator_test COMMAND test_merging_iterator)
 add_executable(test_async_flush tests/test_async_flush.cc src/kv_db.cc src/memtable.cc src/write_batch.cc src/wal.cc src/sstable.cc src/version_set.cc src/merging_iterator.cc src/lru_cache.cc)
 target_link_libraries(test_async_flush Threads::Threads)
 add_test(NAME async_flush_test COMMAND test_async_flush)
+
+
+# Week 3 任务③:自动 Compaction
+add_executable(test_auto_compact tests/test_auto_compact.cc src/kv_db.cc src/memtable.cc src/write_batch.cc src/wal.cc src/sstable.cc src/version_set.cc src/merging_iterator.cc src/lru_cache.cc)
+target_link_libraries(test_auto_compact Threads::Threads)
+add_test(NAME auto_compact_test COMMAND test_auto_compact)

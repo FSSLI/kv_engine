@@ -42,7 +42,7 @@ Status KVDB::Open(const Options& options, std::unique_ptr<KVDB>* dbptr) {
     s = db->Recover();
     if (!s.ok()) return s;
 
-    db->bg_thread_ = std::thread(&KVDB::BackgroundWork, db.get());  // ① 启动线程
+    db->bg_thread_ = std::thread(&KVDB::BackgroundWork, db.get());
 
     dbptr->reset(db.release());
     DEBUG_LOG("KVDB::Open: %s", options.dbname.c_str());
@@ -61,7 +61,7 @@ KVDB::~KVDB() {
         std::lock_guard<std::mutex> lock(mutex_);
         bg_exit_ = true;
     }
-    bg_cv_.notify_one();  // ② 你漏掉的:叫醒睡在 wait 上的后台线程
+    bg_cv_.notify_one();
     if (bg_thread_.joinable()) bg_thread_.join();
 }
 
@@ -114,13 +114,14 @@ Status KVDB::Write(WriteBatch* batch) {
     return Status::OK();
 }
 
+// 任务②:节流核心 —— 先查空间再放行 → mem 满+后台在刷则等 → mem 满+后台空闲则切换
 Status KVDB::MakeRoomForWrite(std::unique_lock<std::mutex>* lock) {
     while (true) {
         if (memtable_->ApproximateMemoryUsage() <= options_.write_buffer_size) {
-            return Status::OK();  // 有空间:即使 imm_ 在刷也不等
+            return Status::OK();
         }
         if (imm_ != nullptr) {
-            imm_done_cv_.wait(*lock);  // mem 满 + 后台在刷:节流
+            imm_done_cv_.wait(*lock);
         } else {
             SwitchToImmutableLocked();
             return Status::OK();
@@ -128,6 +129,7 @@ Status KVDB::MakeRoomForWrite(std::unique_lock<std::mutex>* lock) {
     }
 }
 
+// 任务②:mem → imm 切换 + WAL 切换(顺序 = 崩溃安全:prev_log 先随 snapshot 落盘)
 void KVDB::SwitchToImmutableLocked() {
     wal_->Close();
     uint64_t old_log = version_set_->LogNumber();
@@ -138,7 +140,7 @@ void KVDB::SwitchToImmutableLocked() {
     memtable_.reset(new SkipList());
 
     Status s = OpenNewWAL();
-    if (!s.ok()) DEBUG_LOG("SwitchToImmutable: open WAL failed");  // ③ 去掉 ...
+    if (!s.ok()) DEBUG_LOG("SwitchToImmutable: open WAL failed");
     bg_cv_.notify_one();
 }
 
@@ -200,10 +202,16 @@ Status KVDB::Get(const std::string& key, std::string* value) {
     return Status::NotFound("key not found");
 }
 
+// 后台主循环:先 flush(数据安全),再 compact(性能整理)
 void KVDB::BackgroundWork() {
     std::unique_lock<std::mutex> lock(mutex_);
     while (true) {
-        bg_cv_.wait(lock, [this]{ return imm_ != nullptr || bg_exit_; });
+        // 任务③:wait 谓词加 L0 触发条件 —— flush 完回到循环顶部会重查谓词,
+        // 不需要额外 notify 也能发现该 compact 了
+        bg_cv_.wait(lock, [this]{
+            return imm_ != nullptr || bg_exit_ ||
+                   version_set_->NumLevelFiles(0) >= kL0CompactionTrigger;
+        });
 
         if (imm_ != nullptr) {
             uint64_t file_number = version_set_->NewFileNumber();
@@ -232,6 +240,11 @@ void KVDB::BackgroundWork() {
             }
             imm_.reset();
             imm_done_cv_.notify_all();
+        }
+
+        // 任务③:flush 完(或本就无 flush 而是被 L0 触发唤醒)检查是否该 compact
+        if (version_set_->NumLevelFiles(0) >= kL0CompactionTrigger) {
+            CompactL0ToL1Locked(&lock);
         }
 
         if (bg_exit_ && imm_ == nullptr) return;
@@ -285,14 +298,45 @@ Status KVDB::TEST_FlushMemTable() {
     return Status::OK();
 }
 
-Status KVDB::CompactManually() {
-    std::lock_guard<std::mutex> lock(mutex_);
+// 任务③:等后台彻底空闲(imm_ 刷完 + compaction 收尾)
+Status KVDB::TEST_WaitForBackground() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    WaitForIdleLocked(&lock);
+    return Status::OK();
+}
 
+int KVDB::TEST_NumLevelFiles(int level) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return version_set_->NumLevelFiles(level);
+}
+
+// 任务③:手动 compact = 等后台空闲 → 走同一条 CompactL0ToL1Locked
+Status KVDB::CompactManually() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    WaitForIdleLocked(&lock);
+    return CompactL0ToL1Locked(&lock);
+}
+
+// 任务③:谓词必须同时覆盖 imm_ 和 bg_compacting_,
+// 只查 imm_ 会在 compact 提交半途提前放行调用方
+void KVDB::WaitForIdleLocked(std::unique_lock<std::mutex>* lock) {
+    while (imm_ != nullptr || bg_compacting_) {
+        imm_done_cv_.wait(*lock);
+    }
+}
+
+// 任务③核心:L0(全部)+ 重叠 L1 → 一个新 L1 文件。
+// 锁节奏(与 flush 同款):持锁取现场 → 放锁做归并 IO → 持锁原子提交。
+Status KVDB::CompactL0ToL1Locked(std::unique_lock<std::mutex>* lock) {
     const auto& l0_files = version_set_->GetLevel(0);
     if (l0_files.empty()) {
         return Status::OK();
     }
 
+    // 占坑:等待方(CompactManually / TEST_WaitForBackground)凭它知道 compact 进行中
+    bg_compacting_ = true;
+
+    // ===== 持锁取现场:输入文件快照 + 新文件号(version_set_ 不是线程安全的) =====
     std::vector<FileMetaData> inputs_l0 = l0_files;
 
     std::string smallest = inputs_l0[0].smallest;
@@ -310,99 +354,126 @@ Status KVDB::CompactManually() {
         }
     }
 
-    std::vector<std::shared_ptr<SSTable>> tables_to_keep_alive;
-    std::vector<std::unique_ptr<Iterator>> iters;
-
-    // P0 修复:L0 按"新→旧"顺序创建迭代器
-    for (auto rit = inputs_l0.rbegin(); rit != inputs_l0.rend(); ++rit) {
-        const auto& meta = *rit;
-        std::shared_ptr<SSTable> table;
-        Status s = table_cache_.FindTable(meta.file_number, options_.dbname, &table);
-        if (!s.ok()) return s;
-        tables_to_keep_alive.push_back(table);
-        iters.emplace_back(table->NewIterator());
-    }
-    for (const auto& meta : inputs_l1) {
-        std::shared_ptr<SSTable> table;
-        Status s = table_cache_.FindTable(meta.file_number, options_.dbname, &table);
-        if (!s.ok()) return s;
-        tables_to_keep_alive.push_back(table);
-        iters.emplace_back(table->NewIterator());
-    }
-
     uint64_t new_file_number = version_set_->NewFileNumber();
-    char sst_buf[128];
-    snprintf(sst_buf, sizeof(sst_buf), "%s/%06lu.sst",
-             options_.dbname.c_str(), new_file_number);
 
-    SSTableBuilder builder(sst_buf, 4096);
-    MergingIterator merge(std::move(iters));
-    merge.SeekToFirst();
+    // ===== 放锁做 IO:打开输入表 + 归并 + 写新 SSTable =====
+    // 放锁期间安全:version_set_ 未变、旧文件都在盘上,前台 Get 照常;
+    // 窗口内绝不提前 return(错误用 break 攒在 s 里,出窗口统一处理)
+    lock->unlock();
 
+    Status s = Status::OK();
+    uint64_t file_size = 0;
     std::string first_key, last_key;
     bool first = true;
-    std::string last_output_key;
 
-    while (merge.Valid()) {
-        std::string cur_key = merge.key().ToString();
+    {
+        // Iterator 内部只持有 SSTable 裸指针,必须额外保活 shared_ptr
+        std::vector<std::shared_ptr<SSTable>> tables_to_keep_alive;
+        std::vector<std::unique_ptr<Iterator>> iters;
 
-        if (cur_key != last_output_key) {
-            if (merge.value().size() > 0) {
-                Status s = builder.Add(merge.key(), merge.value());
-                if (!s.ok()) return s;
-                if (first) {
-                    first_key = cur_key;
-                    first = false;
-                }
-                last_key = cur_key;
-            }
-            last_output_key = cur_key;
+        // P0 修复:L0 必须按"新→旧"顺序创建迭代器
+        for (auto rit = inputs_l0.rbegin(); rit != inputs_l0.rend(); ++rit) {
+            std::shared_ptr<SSTable> table;
+            s = table_cache_.FindTable(rit->file_number, options_.dbname, &table);
+            if (!s.ok()) break;
+            tables_to_keep_alive.push_back(table);
+            iters.emplace_back(table->NewIterator());
         }
-        merge.Next();
+        for (const auto& meta : inputs_l1) {
+            if (!s.ok()) break;
+            std::shared_ptr<SSTable> table;
+            s = table_cache_.FindTable(meta.file_number, options_.dbname, &table);
+            if (!s.ok()) break;
+            tables_to_keep_alive.push_back(table);
+            iters.emplace_back(table->NewIterator());
+        }
+
+        if (s.ok()) {
+            char sst_buf[128];
+            snprintf(sst_buf, sizeof(sst_buf), "%s/%06lu.sst",
+                     options_.dbname.c_str(), new_file_number);
+
+            SSTableBuilder builder(sst_buf, 4096);
+            MergingIterator merge(std::move(iters));
+            merge.SeekToFirst();
+
+            std::string last_output_key;
+            while (merge.Valid()) {
+                std::string cur_key = merge.key().ToString();
+
+                if (cur_key != last_output_key) {
+                    if (merge.value().size() > 0) {
+                        s = builder.Add(merge.key(), merge.value());
+                        if (!s.ok()) break;
+                        if (first) {
+                            first_key = cur_key;
+                            first = false;
+                        }
+                        last_key = cur_key;
+                    }
+                    last_output_key = cur_key;
+                }
+                merge.Next();
+            }
+
+            if (s.ok()) {
+                s = builder.Finish(&file_size);
+            }
+        }
     }
 
-    uint64_t file_size = 0;
-    Status s = builder.Finish(&file_size);
-    if (!s.ok()) return s;
+    // ===== 持锁提交:版本变更 + 驱逐缓存 + 删旧文件,一个临界区完成 =====
+    lock->lock();
 
-    for (const auto& meta : inputs_l0) {
-        version_set_->RemoveFile(0, meta.file_number);
-        table_cache_.Evict(meta.file_number);
-    }
-    for (const auto& meta : inputs_l1) {
-        version_set_->RemoveFile(1, meta.file_number);
-        table_cache_.Evict(meta.file_number);
+    if (s.ok()) {
+        for (const auto& meta : inputs_l0) {
+            version_set_->RemoveFile(0, meta.file_number);
+            table_cache_.Evict(meta.file_number);
+        }
+        for (const auto& meta : inputs_l1) {
+            version_set_->RemoveFile(1, meta.file_number);
+            table_cache_.Evict(meta.file_number);
+        }
+
+        if (first) {
+            // 全 tombstone:输出为空,新文件直接删、不进版本
+            char sst_buf[128];
+            snprintf(sst_buf, sizeof(sst_buf), "%s/%06lu.sst",
+                     options_.dbname.c_str(), new_file_number);
+            remove(sst_buf);
+        } else {
+            FileMetaData new_meta;
+            new_meta.file_number = new_file_number;
+            new_meta.file_size = file_size;
+            new_meta.smallest = first_key;
+            new_meta.largest = last_key;
+            version_set_->AddFile(1, new_meta);
+        }
+
+        s = version_set_->WriteSnapshot();
+        if (s.ok()) {
+            // snapshot 落盘后才删旧 SSTable(与 WAL 同款崩溃安全顺序)
+            for (const auto& meta : inputs_l0) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "%s/%06lu.sst", options_.dbname.c_str(), meta.file_number);
+                remove(buf);
+            }
+            for (const auto& meta : inputs_l1) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "%s/%06lu.sst", options_.dbname.c_str(), meta.file_number);
+                remove(buf);
+            }
+        }
     }
 
-    if (first) {
-        remove(sst_buf);
-    } else {
-        FileMetaData new_meta;
-        new_meta.file_number = new_file_number;
-        new_meta.file_size = file_size;
-        new_meta.smallest = first_key;
-        new_meta.largest = last_key;
-        version_set_->AddFile(1, new_meta);
-    }
+    // 收尾:无论成败都要清标志 + 通知,否则等待方睡死
+    bg_compacting_ = false;
+    imm_done_cv_.notify_all();
 
-    s = version_set_->WriteSnapshot();
-    if (!s.ok()) return s;
-
-    for (const auto& meta : inputs_l0) {
-        char buf[128];
-        snprintf(buf, sizeof(buf), "%s/%06lu.sst", options_.dbname.c_str(), meta.file_number);
-        remove(buf);
-    }
-    for (const auto& meta : inputs_l1) {
-        char buf[128];
-        snprintf(buf, sizeof(buf), "%s/%06lu.sst", options_.dbname.c_str(), meta.file_number);
-        remove(buf);
-    }
-
-    DEBUG_LOG("KVDB::CompactManually: L0=%d L1=%d new_file=%lu",
+    DEBUG_LOG("KVDB::CompactL0ToL1: L0=%d L1=%d new_file=%lu",
               version_set_->NumLevelFiles(0), version_set_->NumLevelFiles(1),
               new_file_number);
-    return Status::OK();
+    return s;
 }
 
 Status KVDB::Recover() {

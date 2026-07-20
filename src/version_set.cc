@@ -230,7 +230,20 @@ Status VersionSet::WriteSnapshot() {
 }
 
 void VersionSet::AddFile(int level, const FileMetaData& meta) {
-    levels_[level].push_back(meta);
+    if (level == 0) {
+        // L0:按 file_number 升序(file_number 单调增,追加即可),
+        // Get 从 rbegin 扫 = 新→旧,compaction 迭代器顺序也依赖它
+        levels_[level].push_back(meta);
+    } else {
+        // L1+:必须按 smallest key 升序(范围互不重叠)。
+        // Get 的二分查找依赖这个不变式;compaction 产出的新文件
+        // 范围可能比现有文件更小(覆盖写场景:旧 compact 出高段,
+        // 新 compact 出低段),无脑追加会破序 → 数据"查无此人"。
+        auto& files = levels_[level];
+        auto it = files.begin();
+        while (it != files.end() && it->smallest < meta.smallest) ++it;
+        files.insert(it, meta);
+    }
 }
 
 void VersionSet::RemoveFile(int level, uint64_t file_number) {

@@ -1,0 +1,15 @@
+/home/machao/projects/kv_engine/build-release/CMakeFiles/test_skiplist.dir
+/home/machao/projects/kv_engine/build-release/CMakeFiles/test_write_batch.dir
+/home/machao/projects/kv_engine/build-release/CMakeFiles/test_wal.dir
+/home/machao/projects/kv_engine/build-release/CMakeFiles/test_sstable.dir
+/home/machao/projects/kv_engine/build-release/CMakeFiles/test_version_set.dir
+/home/machao/projects/kv_engine/build-release/CMakeFiles/test_kv_db.dir
+/home/machao/projects/kv_engine/build-release/CMakeFiles/test_lru_cache.dir
+/home/machao/projects/kv_engine/build-release/CMakeFiles/test_merging_iterator.dir
+/home/machao/projects/kv_engine/build-release/CMakeFiles/test_async_flush.dir
+/home/machao/projects/kv_engine/build-release/CMakeFiles/test_auto_compact.dir
+/home/machao/projects/kv_engine/build-release/CMakeFiles/test_bloom_filter.dir
+/home/machao/projects/kv_engine/build-release/CMakeFiles/bench_kv.dir
+/home/machao/projects/kv_engine/build-release/CMakeFiles/test.dir
+/home/machao/projects/kv_engine/build-release/CMakeFiles/edit_cache.dir
+/home/machao/projects/kv_engine/build-release/CMakeFiles/rebuild_cache.dir

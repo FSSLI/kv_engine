@@ -164,7 +164,11 @@ public:
 
 private:
     std::mutex mutex_;
-    std::unordered_map<uint64_t, std::weak_ptr<SSTable>> cache_;
+    // 强引用缓存:FindTable 命中即复用,避免每次 Get 都重新 Open 整个 SSTable
+    // (fopen + 读 footer/filter/index 全解析,~数十 us/文件)。
+    // 被 compaction 删除的文件由 Evict 从缓存移除,归并迭代器持有的
+    // shared_ptr 保证其在归并期间存活,最后一个读者释放时回收。
+    std::unordered_map<uint64_t, std::shared_ptr<SSTable>> cache_;
     LRUCache* block_cache_ = nullptr;
 
     TableCache(const TableCache&) = delete;

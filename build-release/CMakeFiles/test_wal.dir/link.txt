@@ -1,0 +1,1 @@
+/usr/bin/c++ -O2 -DNDEBUG CMakeFiles/test_wal.dir/tests/test_wal.cc.o CMakeFiles/test_wal.dir/src/wal.cc.o CMakeFiles/test_wal.dir/src/write_batch.cc.o -o test_wal 

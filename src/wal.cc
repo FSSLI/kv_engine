@@ -19,7 +19,7 @@ static uint32_t DecodeFixed32(const char* ptr) {
            (static_cast<uint32_t>(static_cast<uint8_t>(ptr[3])) << 24);
 }
 
-WAL::WAL(FILE* file, bool writable) 
+WAL::WAL(FILE* file, bool writable)
     : file_(file), writable_(writable), file_size_(0) {
     if (!writable && file_) {
         int fd = fileno(file_);
@@ -94,12 +94,16 @@ Status WAL::Append(const WriteBatch& batch, uint64_t sequence_number) {
 
     file_size_ += written;
 
-    s = Sync();
-    if (!s.ok()) {
-        return s;
+    // 默认每次都 fsync(崩溃不丢数据);压测可用 SetSyncOnWrite(false) 关掉。
+    // 关掉后持久性边界退化为:memtable flush 时 WAL::Close 仍会 Sync 一次。
+    if (sync_on_write_) {
+        s = Sync();
+        if (!s.ok()) {
+            return s;
+        }
     }
 
-    DEBUG_LOG("WAL::Append: seq=%lu, size=%zu, file_size=%lu", 
+    DEBUG_LOG("WAL::Append: seq=%lu, size=%zu, file_size=%lu",
               sequence_number, record.size(), file_size_);
     return Status::OK();
 }
@@ -138,7 +142,7 @@ bool WAL::ReadNext(uint64_t* sequence_number, WriteBatch* batch) {
 
         n = fread(&record[4], 1, batch_length, file_);
         if (n != batch_length) {
-            DEBUG_LOG("WAL::ReadNext: truncated record body, expected=%u, got=%zu", 
+            DEBUG_LOG("WAL::ReadNext: truncated record body, expected=%u, got=%zu",
                       batch_length, n);
             return false;  // 尾部截断
         }
@@ -151,7 +155,7 @@ bool WAL::ReadNext(uint64_t* sequence_number, WriteBatch* batch) {
 
         // 单条记录损坏（如 checksum 失败），跳过并尝试读取下一条
         // 此时文件指针已自然位于下一条记录的开头
-        DEBUG_LOG("WAL::ReadNext: deserialize failed: %s, skipping to next record", 
+        DEBUG_LOG("WAL::ReadNext: deserialize failed: %s, skipping to next record",
                   s.ToString().c_str());
     }
 }

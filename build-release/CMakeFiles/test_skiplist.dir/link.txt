@@ -1,0 +1,1 @@
+/usr/bin/c++ -O2 -DNDEBUG CMakeFiles/test_skiplist.dir/tests/test_skiplist.cc.o CMakeFiles/test_skiplist.dir/src/memtable.cc.o -o test_skiplist 

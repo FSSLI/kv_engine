@@ -4,10 +4,10 @@
 #include <algorithm>
 #include <cstring>
 #include <cassert>
+#include <cerrno>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <cstdio>
-#include <cerrno>
 
 #ifdef KV_DEBUG
     #define DEBUG_LOG(fmt, ...) printf("[DEBUG] " fmt "\n", ##__VA_ARGS__)
@@ -405,13 +405,9 @@ Status SSTable::Open(const std::string& filename,
     }
 
 // 并发安全版:pread 一次调用自带偏移、原子定位,不碰 FILE* 内部游标。
-
 // 修复前(fseek+fread 两步):前台 Get 与后台 compaction 归并经 TableCache
-
 // 共享同一 SSTable 实例时,两线程的 fseek/fread 会交错,读到错误偏移的块,
-
 // 表现为 key 偶发"不存在"(复现:4 线程并发 Get,40 万次约 170 次错误)。
-
 Status SSTable::ReadAt(uint64_t offset, size_t size, std::string* result) const {
     result->resize(size);
     int fd = fileno(file_);
@@ -702,12 +698,9 @@ Status TableCache::FindTable(uint64_t file_number, const std::string& dbname,
 
     auto it = cache_.find(file_number);
     if (it != cache_.end()) {
-        *table = it->second.lock();
-        if (*table) {
-            DEBUG_LOG("TableCache::FindTable: cache hit %lu", file_number);
-            return Status::OK();
-        }
-        cache_.erase(it);
+        *table = it->second;  // 强引用直接复用,不再每次 Get 都 reopen
+        DEBUG_LOG("TableCache::FindTable: cache hit %lu", file_number);
+        return Status::OK();
     }
 
     char buf[32];

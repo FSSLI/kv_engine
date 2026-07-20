@@ -75,6 +75,7 @@ Status KVDB::OpenNewWAL() {
     std::unique_ptr<WAL> wal;
     Status s = WAL::Create(buf, &wal);
     if (!s.ok()) return s;
+    wal->SetSyncOnWrite(wal_sync_on_write_);  // 轮换出的新 WAL 继承压测开关
     wal_ = std::move(wal);
 
     version_set_->SetLogNumber(log_number);
@@ -413,6 +414,14 @@ Status KVDB::TEST_WaitForBackground() {
 int KVDB::TEST_NumLevelFiles(int level) {
     std::lock_guard<std::mutex> lock(mutex_);
     return version_set_->NumLevelFiles(level);
+}
+
+// 压测辅助:记录开关并转发给当前 WAL;之后轮换出的新 WAL 在 OpenNewWAL 里继承。
+// 持锁与 Put 互斥,避免切换瞬间撞上 wal_ 替换。
+void KVDB::SetWALSyncOnWrite(bool on) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    wal_sync_on_write_ = on;
+    wal_->SetSyncOnWrite(on);
 }
 
 // 任务③重构:手动 compact 变成"等后台空闲 → 走同一条 CompactL0ToL1Locked"的壳。

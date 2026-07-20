@@ -79,3 +79,7 @@ add_test(NAME auto_compact_test COMMAND test_auto_compact)
 add_executable(test_bloom_filter tests/test_bloom_filter.cc src/bloom_filter.cc src/sstable.cc src/lru_cache.cc)
 target_link_libraries(test_bloom_filter Threads::Threads)
 add_test(NAME bloom_filter_test COMMAND test_bloom_filter)
+
+# Week 4 任务②:基准测试(必须用 Release 构建跑,数字才有意义)
+add_executable(bench_kv bench/bench_kv.cc src/kv_db.cc src/memtable.cc src/write_batch.cc src/wal.cc src/sstable.cc src/version_set.cc src/merging_iterator.cc src/lru_cache.cc src/bloom_filter.cc)
+target_link_libraries(bench_kv Threads::Threads)

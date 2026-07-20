@@ -44,6 +44,10 @@ public:
 
     Status CompactManually();
 
+    // 压测辅助:开关 WAL 每次 Append 后的 fsync(默认开,生产语义不变)。
+    // 记录在 wal_sync_on_write_ 上,WAL 轮换(memtable 写满切换)后依然生效。
+    void SetWALSyncOnWrite(bool on);
+
 private:
     explicit KVDB(const Options& options);
 
@@ -90,6 +94,7 @@ private:
 
     std::unique_ptr<WAL> wal_;
     std::string wal_filename_;
+    bool wal_sync_on_write_ = true;   // 压测开关:WAL Append 后是否 fsync,跨 WAL 轮换保持
     std::atomic<uint64_t> last_sequence_{1};
 
     // 任务②:后台线程与同步原语

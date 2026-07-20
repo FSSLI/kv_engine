@@ -1,0 +1,1 @@
+/usr/bin/c++ -O2 -DNDEBUG CMakeFiles/test_write_batch.dir/tests/test_write_batch.cc.o CMakeFiles/test_write_batch.dir/src/write_batch.cc.o -o test_write_batch 

@@ -25,7 +25,8 @@ public:
 
     ~WAL();
 
-    // 追加一条 WriteBatch（含 fsync）
+    // 追加一条 WriteBatch
+    // 默认每次 Append 后 fsync(生产语义);SetSyncOnWrite(false) 可关,仅供压测。
     Status Append(const WriteBatch& batch, uint64_t sequence_number);
 
     // 读取下一条记录（用于恢复）
@@ -36,11 +37,15 @@ public:
     // 强制刷盘
     Status Sync();
 
-    // 关闭文件
+    // 关闭文件（Close 始终会 Sync 一次,与 sync_on_write_ 无关）
     Status Close();
 
     // 获取当前文件大小
     uint64_t FileSize() const;
+
+    // 压测开关:是否每次 Append 后 fsync。默认 true,行为与之前完全一致。
+    // 只在写入开始前调用(非线程安全的热切换,压测场景够用)。
+    void SetSyncOnWrite(bool on) { sync_on_write_ = on; }
 
 private:
     WAL(FILE* file, bool writable);
@@ -48,6 +53,7 @@ private:
     FILE* file_;
     bool writable_;
     uint64_t file_size_;
+    bool sync_on_write_ = true;
 
     // 禁止拷贝
     WAL(const WAL&) = delete;

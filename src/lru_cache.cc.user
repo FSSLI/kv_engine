@@ -1,0 +1,77 @@
+#include "lru_cache.h"
+
+namespace kv {
+
+LRUCache::LRUCache(size_t capacity_bytes)
+    : capacity_(capacity_bytes) {
+}
+
+bool LRUCache::Get(uint64_t key, std::string* value) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = index_.find(key);
+    if(it != index_.end()){
+        lru_.splice(lru_.begin(), lru_, it->second);
+        hits_++;
+        *value = it->second->value;
+        return true;
+    }else{
+        misses_++;
+        return false;
+    }
+}
+
+void LRUCache::EraseUnlocked(std::list<Node>::iterator it) {
+    usage_ -= it->charge;
+    index_.erase(it->key);
+    lru_.erase(it);
+}
+
+void LRUCache::Put(uint64_t key, const std::string& value) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    size_t charge = value.size();
+    if (charge > capacity_) return;
+
+    auto it = index_.find(key);
+    if(it != index_.end()){
+        EraseUnlocked(it->second);
+    }
+    lru_.push_front({key, value, charge});
+    index_[key] = lru_.begin();
+    usage_ += charge;
+}
+
+void LRUCache::EvictFile(uint64_t file_number) {
+    for(auto it = index_.begin(); it != index_.end();){
+        if((it->first >> 32) == file_number){
+            usage_ -= it->second->charge;
+            lru_.erase(it->second);
+            it = index_.erase(it);
+        }else{
+            it++;
+        }
+    }
+}
+
+void LRUCache::Clear() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    lru_.clear();
+    index_.clear();
+    usage_ = 0;
+}
+
+size_t LRUCache::TotalCharge() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return usage_;
+}
+
+uint64_t LRUCache::Hits() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return hits_;
+}
+
+uint64_t LRUCache::Misses() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return misses_;
+}
+
+}  // namespace kv

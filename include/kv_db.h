@@ -22,6 +22,7 @@ public:
     struct Options {
         size_t write_buffer_size = 4 * 1024 * 1024;
         size_t block_cache_capacity = 8 * 1024 * 1024;  // BlockCache 容量,0 = 关闭
+        int bloom_bits_per_key = 10;  // 布隆过滤器位数/key,0 = 关闭(理论误判率 ~1%)
         std::string dbname = "/tmp/kv_db";
     };
 

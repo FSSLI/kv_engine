@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <string>
 #include <vector>
 #include <memory>
@@ -23,8 +24,11 @@ uint64_t DecodeFixed64(const char* ptr);
 
 class SSTableBuilder {
 public:
-    explicit SSTableBuilder(const std::string& filename, 
-                            size_t block_size = 4096);
+    // bloom_bits_per_key > 0 时,Finish 会为整文件写一个布隆过滤器块;
+    // = 0 兼容旧行为(不生成过滤器,footer 里 filter_size = 0)
+    explicit SSTableBuilder(const std::string& filename,
+                            size_t block_size = 4096,
+                            int bloom_bits_per_key = 0);
     ~SSTableBuilder();
 
     Status Add(const Slice& key, const Slice& value);
@@ -38,6 +42,8 @@ private:
     FILE* file_;
     std::string filename_;
     size_t block_size_;
+    int bloom_bits_per_key_;
+    std::vector<std::string> pending_keys_;  // 建过滤器用,Finish 时一次性编码
     std::string current_block_;
     uint32_t current_block_entries_;
     std::string first_key_;
@@ -101,6 +107,10 @@ public:
     Slice LargestKey() const { return Slice(largest_key_); }
     const std::string& Filename() const { return filename_; }
 
+    // 布隆过滤器拦下的查询次数(被拦 = 一次磁盘读都没发生)。
+    // 测试与压测用它量化过滤器效果。
+    uint64_t FilterRejections() const { return filter_rejections_.load(); }
+
 private:
     struct IndexEntry {
         std::string last_key;
@@ -129,6 +139,11 @@ private:
 
     uint64_t file_number_ = 0;          // BlockCache key 的高 32 位
     LRUCache* block_cache_ = nullptr;   // 不持有所有权,owner 是 KVDB
+
+    // Week 4:整文件布隆过滤器,Open 时一次读进内存(通常几百字节~几 KB)。
+    // 为空 = 该文件没有过滤器(旧文件 / 构建时关闭)。
+    std::string filter_data_;
+    mutable std::atomic<uint64_t> filter_rejections_{0};
 
     SSTable(const SSTable&) = delete;
     SSTable& operator=(const SSTable&) = delete;

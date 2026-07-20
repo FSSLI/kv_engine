@@ -43,7 +43,7 @@ add_test(NAME write_batch_test COMMAND test_write_batch)
 add_executable(test_wal tests/test_wal.cc src/wal.cc src/write_batch.cc)
 add_test(NAME wal_test COMMAND test_wal)
 
-add_executable(test_sstable tests/test_sstable.cc src/sstable.cc src/memtable.cc src/lru_cache.cc)
+add_executable(test_sstable tests/test_sstable.cc src/sstable.cc src/memtable.cc src/lru_cache.cc src/bloom_filter.cc)
 target_link_libraries(test_sstable Threads::Threads)
 add_test(NAME sstable_test COMMAND test_sstable)
 
@@ -52,7 +52,7 @@ target_link_libraries(test_version_set Threads::Threads)
 add_test(NAME version_set_test COMMAND test_version_set)
 
 # 修改 test_kv_db 的依赖，加入 version_set.cc
-add_executable(test_kv_db tests/test_kv_db.cc src/kv_db.cc src/memtable.cc src/write_batch.cc src/wal.cc src/sstable.cc src/version_set.cc src/merging_iterator.cc src/lru_cache.cc)
+add_executable(test_kv_db tests/test_kv_db.cc src/kv_db.cc src/memtable.cc src/write_batch.cc src/wal.cc src/sstable.cc src/version_set.cc src/merging_iterator.cc src/lru_cache.cc src/bloom_filter.cc)
 target_link_libraries(test_kv_db Threads::Threads)
 add_test(NAME kv_db_test COMMAND test_kv_db)
 
@@ -65,12 +65,17 @@ target_link_libraries(test_merging_iterator Threads::Threads)
 add_test(NAME merging_iterator_test COMMAND test_merging_iterator)
 
 # Week 3 任务②:双 MemTable + 异步 flush
-add_executable(test_async_flush tests/test_async_flush.cc src/kv_db.cc src/memtable.cc src/write_batch.cc src/wal.cc src/sstable.cc src/version_set.cc src/merging_iterator.cc src/lru_cache.cc)
+add_executable(test_async_flush tests/test_async_flush.cc src/kv_db.cc src/memtable.cc src/write_batch.cc src/wal.cc src/sstable.cc src/version_set.cc src/merging_iterator.cc src/lru_cache.cc src/bloom_filter.cc)
 target_link_libraries(test_async_flush Threads::Threads)
 add_test(NAME async_flush_test COMMAND test_async_flush)
 
 
 # Week 3 任务③:自动 Compaction
-add_executable(test_auto_compact tests/test_auto_compact.cc src/kv_db.cc src/memtable.cc src/write_batch.cc src/wal.cc src/sstable.cc src/version_set.cc src/merging_iterator.cc src/lru_cache.cc)
+add_executable(test_auto_compact tests/test_auto_compact.cc src/kv_db.cc src/memtable.cc src/write_batch.cc src/wal.cc src/sstable.cc src/version_set.cc src/merging_iterator.cc src/lru_cache.cc src/bloom_filter.cc)
 target_link_libraries(test_auto_compact Threads::Threads)
 add_test(NAME auto_compact_test COMMAND test_auto_compact)
+
+# Week 4 任务①:布隆过滤器
+add_executable(test_bloom_filter tests/test_bloom_filter.cc src/bloom_filter.cc src/sstable.cc src/lru_cache.cc)
+target_link_libraries(test_bloom_filter Threads::Threads)
+add_test(NAME bloom_filter_test COMMAND test_bloom_filter)

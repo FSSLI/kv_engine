@@ -1,11 +1,13 @@
 #include "sstable.h"
 #include "lru_cache.h"
+#include "bloom_filter.h"
 #include <algorithm>
 #include <cstring>
 #include <cassert>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <cstdio>
+#include <cerrno>
 
 #ifdef KV_DEBUG
     #define DEBUG_LOG(fmt, ...) printf("[DEBUG] " fmt "\n", ##__VA_ARGS__)
@@ -16,6 +18,12 @@
 namespace kv {
 
 static const uint64_t kTableMagicNumber = 0x6373646264657665ULL;
+
+// footer v2(48B):filter_offset(8) filter_size(8) index_offset(8)
+//                 index_size(8) num_entries(8) magic(8)
+// v1 是 32B、无过滤器字段;v2 通过 magic 不变、文件总长校验区分,
+// 本项目内不保证打开 v1 旧文件(测试每次重建,无迁移负担)。
+static const size_t kFooterSize = 48;
 
 void EncodeFixed32(std::string* dst, uint32_t value) {
     char buf[4];
@@ -51,10 +59,12 @@ uint64_t DecodeFixed64(const char* ptr) {
 
 // ============ SSTableBuilder ============
 
-SSTableBuilder::SSTableBuilder(const std::string& filename, size_t block_size)
+SSTableBuilder::SSTableBuilder(const std::string& filename, size_t block_size,
+                               int bloom_bits_per_key)
     : file_(nullptr)
     , filename_(filename)
     , block_size_(block_size)
+    , bloom_bits_per_key_(bloom_bits_per_key)
     , current_block_entries_(0)
     , index_block_count_(0)
     , num_entries_(0)
@@ -113,6 +123,9 @@ Status SSTableBuilder::Add(const Slice& key, const Slice& value) {
     current_block_entries_++;
     num_entries_++;
     last_key_ = key.ToString();
+    if (bloom_bits_per_key_ > 0) {
+        pending_keys_.push_back(key.ToString());  // Finish 时一次性编码过滤器
+    }
 
     return Status::OK();
 }
@@ -166,6 +179,19 @@ Status SSTableBuilder::Finish(uint64_t* file_size) {
     Status s = FlushBlock();
     if (!s.ok()) return s;
 
+    // 过滤器块紧跟数据块之后、索引块之前
+    uint64_t filter_offset = current_offset_;
+    uint64_t filter_size = 0;
+    if (bloom_bits_per_key_ > 0) {
+        BloomFilterPolicy policy(bloom_bits_per_key_);
+        std::string filter_block;
+        policy.CreateFilter(pending_keys_, &filter_block);
+        s = WriteRaw(filter_block);
+        if (!s.ok()) return s;
+        filter_size = filter_block.size();
+        current_offset_ += filter_size;
+    }
+
     std::string index;
     EncodeFixed32(&index, index_block_count_);
     index.append(index_block_);
@@ -178,6 +204,8 @@ Status SSTableBuilder::Finish(uint64_t* file_size) {
     current_offset_ += index_size;
 
     std::string footer;
+    EncodeFixed64(&footer, filter_offset);
+    EncodeFixed64(&footer, filter_size);
     EncodeFixed64(&footer, index_offset);
     EncodeFixed64(&footer, index_size);
     EncodeFixed64(&footer, num_entries_);
@@ -243,34 +271,51 @@ Status SSTable::Open(const std::string& filename,
     }
     uint64_t file_size = static_cast<uint64_t>(st.st_size);
 
-    if (file_size < 32) {
+    if (file_size < kFooterSize) {
         fclose(file);
         return Status::Corruption("SSTable file too small");
     }
 
-    char footer_buf[32];
-    if (fseek(file, -32, SEEK_END) != 0) {
+    char footer_buf[kFooterSize];
+    if (fseek(file, -static_cast<long>(kFooterSize), SEEK_END) != 0) {
         fclose(file);
         return Status::IOError("cannot seek to footer");
     }
-    if (fread(footer_buf, 1, 32, file) != 32) {
+    if (fread(footer_buf, 1, kFooterSize, file) != kFooterSize) {
         fclose(file);
         return Status::IOError("cannot read footer");
     }
 
-    uint64_t index_offset = DecodeFixed64(footer_buf);
-    uint64_t index_size = DecodeFixed64(footer_buf + 8);
-    uint64_t num_entries = DecodeFixed64(footer_buf + 16);
-    uint64_t magic = DecodeFixed64(footer_buf + 24);
+    uint64_t filter_offset = DecodeFixed64(footer_buf);
+    uint64_t filter_size = DecodeFixed64(footer_buf + 8);
+    uint64_t index_offset = DecodeFixed64(footer_buf + 16);
+    uint64_t index_size = DecodeFixed64(footer_buf + 24);
+    uint64_t num_entries = DecodeFixed64(footer_buf + 32);
+    uint64_t magic = DecodeFixed64(footer_buf + 40);
 
     if (magic != kTableMagicNumber) {
         fclose(file);
         return Status::Corruption("SSTable magic number mismatch");
     }
 
-    if (index_offset + index_size + 32 != file_size) {
+    if (index_offset + index_size + kFooterSize != file_size) {
         fclose(file);
         return Status::Corruption("SSTable footer inconsistent");
+    }
+    if (filter_size > 0 && filter_offset + filter_size != index_offset) {
+        fclose(file);
+        return Status::Corruption("SSTable filter block inconsistent");
+    }
+
+    // 过滤器块整个读进内存(10 bits/key,1 万个 key 也才 ~12KB)
+    std::string filter_data;
+    if (filter_size > 0) {
+        filter_data.resize(static_cast<size_t>(filter_size));
+        if (fseek(file, static_cast<long>(filter_offset), SEEK_SET) != 0 ||
+            fread(&filter_data[0], 1, static_cast<size_t>(filter_size), file) != filter_size) {
+            fclose(file);
+            return Status::IOError("cannot read filter block");
+        }
     }
 
     std::string index_data;
@@ -347,6 +392,7 @@ Status SSTable::Open(const std::string& filename,
                               smallest_key, largest_key,
                               index_offset, index_size,
                               file_number, block_cache));
+    (*table)->filter_data_ = std::move(filter_data);
                               
     size_t loaded_blocks = entries.size();
     (*table)->index_entries_ = std::move(entries);
@@ -358,13 +404,29 @@ Status SSTable::Open(const std::string& filename,
         return Status::OK();
     }
 
+// 并发安全版:pread 一次调用自带偏移、原子定位,不碰 FILE* 内部游标。
+
+// 修复前(fseek+fread 两步):前台 Get 与后台 compaction 归并经 TableCache
+
+// 共享同一 SSTable 实例时,两线程的 fseek/fread 会交错,读到错误偏移的块,
+
+// 表现为 key 偶发"不存在"(复现:4 线程并发 Get,40 万次约 170 次错误)。
+
 Status SSTable::ReadAt(uint64_t offset, size_t size, std::string* result) const {
     result->resize(size);
-    if (fseek(file_, static_cast<long>(offset), SEEK_SET) != 0) {
-        return Status::IOError("SSTable seek failed");
-    }
-    if (fread(&(*result)[0], 1, size, file_) != size) {
-        return Status::IOError("SSTable read failed");
+    int fd = fileno(file_);
+    size_t done = 0;
+    while (done < size) {
+        ssize_t n = pread(fd, &(*result)[done], size - done,
+                          static_cast<off_t>(offset + done));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return Status::IOError("SSTable pread failed");
+        }
+        if (n == 0) {
+            return Status::IOError("SSTable short read");
+        }
+        done += static_cast<size_t>(n);
     }
     return Status::OK();
 }
@@ -396,9 +458,18 @@ Status SSTable::FindBlock(const Slice& key, uint64_t* offset, uint64_t* size) co
 }
 
 Status SSTable::Get(const Slice& key, std::string* value) const {
-    if (key.compare(Slice(smallest_key_)) < 0 || 
+    if (key.compare(Slice(smallest_key_)) < 0 ||
         key.compare(Slice(largest_key_)) > 0) {
         return Status::NotFound("key out of range");
+    }
+
+    // Week 4 布隆过滤器:一次内存位运算换掉一次磁盘读(+一次缓存查找)。
+    // 被拦 = key 一定不在这个文件里,直接 NotFound。
+    if (!filter_data_.empty() &&
+        !BloomFilterPolicy::KeyMayMatch(key, Slice(filter_data_))) {
+        filter_rejections_.fetch_add(1);
+        DEBUG_LOG("BloomFilter reject: %.*s", static_cast<int>(key.size()), key.data());
+        return Status::NotFound("key rejected by bloom filter");
     }
 
     uint64_t offset, size;

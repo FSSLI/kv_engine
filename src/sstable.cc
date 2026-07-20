@@ -1,4 +1,5 @@
 #include "sstable.h"
+#include "lru_cache.h"
 #include <algorithm>
 #include <cstring>
 #include <cassert>
@@ -204,7 +205,8 @@ Status SSTableBuilder::Finish(uint64_t* file_size) {
 SSTable::SSTable(FILE* file, const std::string& filename,
                  uint64_t file_size, uint64_t num_entries,
                  const std::string& smallest, const std::string& largest,
-                 uint64_t index_offset, uint64_t index_size)
+                 uint64_t index_offset, uint64_t index_size,
+                 uint64_t file_number, LRUCache* block_cache)
     : file_(file)
     , filename_(filename)
     , file_size_(file_size)
@@ -213,6 +215,8 @@ SSTable::SSTable(FILE* file, const std::string& filename,
     , largest_key_(largest)
     , index_offset_(index_offset)
     , index_size_(index_size)
+    , file_number_(file_number)
+    , block_cache_(block_cache)
 {
 }
 
@@ -222,8 +226,10 @@ SSTable::~SSTable() {
     }
 }
 
-Status SSTable::Open(const std::string& filename, 
-                       std::unique_ptr<SSTable>* table) {
+Status SSTable::Open(const std::string& filename,
+                       std::unique_ptr<SSTable>* table,
+                       uint64_t file_number,
+                       LRUCache* block_cache) {
     FILE* file = fopen(filename.c_str(), "rb");
     if (!file) {
         return Status::IOError("cannot open SSTable: " + filename);
@@ -339,7 +345,8 @@ Status SSTable::Open(const std::string& filename,
 
     table->reset(new SSTable(file, filename, file_size, num_entries,
                               smallest_key, largest_key,
-                              index_offset, index_size));
+                              index_offset, index_size,
+                              file_number, block_cache));
                               
     size_t loaded_blocks = entries.size();
     (*table)->index_entries_ = std::move(entries);
@@ -398,9 +405,18 @@ Status SSTable::Get(const Slice& key, std::string* value) const {
     Status s = FindBlock(key, &offset, &size);
     if (!s.ok()) return s;
 
+    // BlockCache:同一个数据块只读一次磁盘,之后命中内存。
+    // key = (file_number << 32) | block_offset,file_number 单调递增
+    // 不复用,旧文件的 key 不会被新文件误命中。
     std::string block_data;
-    s = ReadAt(offset, static_cast<size_t>(size), &block_data);
-    if (!s.ok()) return s;
+    uint64_t cache_key = MakeBlockCacheKey(file_number_, offset);
+    if (block_cache_ && block_cache_->Get(cache_key, &block_data)) {
+        DEBUG_LOG("BlockCache hit: file=%lu offset=%lu", file_number_, offset);
+    } else {
+        s = ReadAt(offset, static_cast<size_t>(size), &block_data);
+        if (!s.ok()) return s;
+        if (block_cache_) block_cache_->Put(cache_key, block_data);
+    }
 
     uint32_t num_entries = DecodeFixed32(block_data.data());
     const char* ptr = block_data.data() + 4;
@@ -568,8 +584,17 @@ Status SSTable::Iterator::LoadBlock(uint64_t offset, uint64_t size) {
     current_block_offset_ = offset;
     current_block_size_ = size;
 
-    Status s = table_->ReadAt(offset, static_cast<size_t>(size), &block_data_);
-    if (!s.ok()) return s;
+    // 与 Get 共用同一份 BlockCache:归并/全表扫描同样吃缓存
+    uint64_t cache_key = MakeBlockCacheKey(table_->file_number_, offset);
+    bool hit = false;
+    if (table_->block_cache_) {
+        hit = table_->block_cache_->Get(cache_key, &block_data_);
+    }
+    if (!hit) {
+        Status s = table_->ReadAt(offset, static_cast<size_t>(size), &block_data_);
+        if (!s.ok()) return s;
+        if (table_->block_cache_) table_->block_cache_->Put(cache_key, block_data_);
+    }
 
     entries_.clear();
     uint32_t num_entries = DecodeFixed32(block_data_.data());
@@ -619,7 +644,7 @@ Status TableCache::FindTable(uint64_t file_number, const std::string& dbname,
     std::string filename = dbname + "/" + buf;
 
     std::unique_ptr<SSTable> new_table;
-    Status s = SSTable::Open(filename, &new_table);
+    Status s = SSTable::Open(filename, &new_table, file_number, block_cache_);
     if (!s.ok()) return s;
 
     *table = std::shared_ptr<SSTable>(new_table.release());
@@ -633,6 +658,8 @@ Status TableCache::FindTable(uint64_t file_number, const std::string& dbname,
 void TableCache::Evict(uint64_t file_number) {
     std::lock_guard<std::mutex> lock(mutex_);
     cache_.erase(file_number);
+    // 文件即将被 compaction 删除,同步清掉它的缓存块,防止死块白占空间
+    if (block_cache_) block_cache_->EvictFile(file_number);
     DEBUG_LOG("TableCache::Evict: %lu", file_number);
 }
 

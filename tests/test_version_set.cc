@@ -39,7 +39,11 @@ void TestBasicWriteRead() {
         assert(s.ok());
         assert(vset.LogNumber() == 5);
         assert(vset.PrevLogNumber() == 3);
-        assert(vset.NextFileNumber() == 10);
+        // 修复:MANIFEST 文件本身消耗一个 file number(LevelDB 同款设计),
+        // WriteSnapshot 里 next_file_number_++ 取了 10 给 MANIFEST-000010,
+        // 所以 Recover 回来是 11 而不是 10。Release 构建 NDEBUG 把 assert
+        // 全禁了,这个错误断言一直没暴露 —— 测试必须在 Debug 构建下跑!
+        assert(vset.NextFileNumber() == 11);
         assert(vset.NumLevelFiles(0) == 1);
         assert(vset.GetLevel(0)[0].smallest == "aaa");
     }

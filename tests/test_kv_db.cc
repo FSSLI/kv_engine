@@ -295,6 +295,94 @@ void TestCompactionDeduplication() {
     std::cout << "  PASS: compaction deduplication" << std::endl;
 }
 
+// 回归测试(7.20 P0 bug):同 key 跨两次 flush 产生多版本,
+// Compaction 后必须保留最新值,而不是旧值"复活"
+void TestCompactionCrossFlushOverwrite() {
+    std::cout << "=== TestCompactionCrossFlushOverwrite ===" << std::endl;
+    CleanUp();
+
+    KVDB::Options options;
+    options.dbname = kTestDir;
+
+    std::unique_ptr<KVDB> db;
+    Status s = KVDB::Open(options, &db);
+    assert(s.ok());
+
+    // 同一 key 写两次,各 flush 成一个 L0 文件(旧版本在 file1,新版本在 file2)
+    s = db->Put("k", "v1_old");
+    assert(s.ok());
+    s = db->TEST_FlushMemTable();
+    assert(s.ok());
+
+    s = db->Put("k", "v2_new");
+    assert(s.ok());
+    s = db->TEST_FlushMemTable();
+    assert(s.ok());
+
+    // Compaction 前确认读到的是新值
+    std::string value;
+    s = db->Get("k", &value);
+    assert(s.ok() && value == "v2_new");
+
+    // 手动 Compaction L0→L1
+    s = db->CompactManually();
+    assert(s.ok());
+
+    // 关键断言:Compaction 后仍是新值(修复前这里会读到 v1_old)
+    value.clear();
+    s = db->Get("k", &value);
+    assert(s.ok() && value == "v2_new");
+
+    // 再 reopen 验证落盘后依然正确
+    db.reset();
+    s = KVDB::Open(options, &db);
+    assert(s.ok());
+    value.clear();
+    s = db->Get("k", &value);
+    assert(s.ok() && value == "v2_new");
+
+    std::cout << "  PASS: compaction keeps newest version across flushes" << std::endl;
+}
+
+// 回归测试:Compaction 输入全是 tombstone 时不应产生空 range 的 L1 文件
+void TestCompactionAllTombstones() {
+    std::cout << "=== TestCompactionAllTombstones ===" << std::endl;
+    CleanUp();
+
+    KVDB::Options options;
+    options.dbname = kTestDir;
+
+    std::unique_ptr<KVDB> db;
+    Status s = KVDB::Open(options, &db);
+    assert(s.ok());
+
+    s = db->Put("dead", "x");
+    assert(s.ok());
+    s = db->TEST_FlushMemTable();
+    assert(s.ok());
+    s = db->Delete("dead");
+    assert(s.ok());
+    s = db->TEST_FlushMemTable();
+    assert(s.ok());
+
+    s = db->CompactManually();
+    assert(s.ok());
+
+    std::string value;
+    s = db->Get("dead", &value);
+    assert(s.IsNotFound());
+
+    // reopen 后依然 NotFound(若产生了空 range L1 文件,这里可能行为异常)
+    db.reset();
+    s = KVDB::Open(options, &db);
+    assert(s.ok());
+    value.clear();
+    s = db->Get("dead", &value);
+    assert(s.IsNotFound());
+
+    std::cout << "  PASS: compaction with all tombstones" << std::endl;
+}
+
 int main() {
     std::cout << "KVDB Tests Starting..." << std::endl;
 
@@ -306,6 +394,8 @@ int main() {
     TestCompactManually();
     TestDeleteAfterFlush();
     TestCompactionDeduplication();
+    TestCompactionCrossFlushOverwrite();
+    TestCompactionAllTombstones();
 
     CleanUp();
     std::cout << "\nAll tests passed!" << std::endl;

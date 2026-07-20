@@ -47,7 +47,13 @@ Status KVDB::Open(const Options& options, std::unique_ptr<KVDB>* dbptr) {
     return Status::OK();
 }
 
-KVDB::KVDB(const Options& options) : options_(options), memtable_(new SkipList()) {}
+KVDB::KVDB(const Options& options) : options_(options), memtable_(new SkipList()) {
+    // BlockCache:所有 SSTable 读共享一份缓存,0 表示关闭
+    if (options_.block_cache_capacity > 0) {
+        block_cache_.reset(new LRUCache(options_.block_cache_capacity));
+        table_cache_.SetBlockCache(block_cache_.get());
+    }
+}
 
 KVDB::~KVDB() = default;
 
@@ -119,7 +125,8 @@ Status KVDB::Get(const std::string& key, std::string* value) {
             for (auto it = files.rbegin(); it != files.rend(); ++it) {
                 std::shared_ptr<SSTable> table;
                 Status s = table_cache_.FindTable(it->file_number, options_.dbname, &table);
-                if (!s.ok()) continue;
+                // 修复:文件损坏要上报,不能静默跳过当成 NotFound
+                if (!s.ok()) return s;
                 s = table->Get(key, value);
                 if (s.ok()) {
                     // 修复：空 value 表示 Delete 标记
@@ -244,7 +251,12 @@ Status KVDB::CompactManually() {
     std::vector<std::shared_ptr<SSTable>> tables_to_keep_alive;
     std::vector<std::unique_ptr<Iterator>> iters;
 
-    for (const auto& meta : inputs_l0) {
+    // 修复(P0):L0 必须按"新→旧"顺序创建迭代器。
+    // levels_[0] 是 Append 顺序(旧文件在前),正序遍历会让最旧的 L0 文件
+    // 拿到最小 index;而 MergingIterator 在同 key 时让 index 小的先出堆,
+    // 去重保留先出堆的版本 → 旧值会"复活"。倒序后最新 L0 拿到 index 0。
+    for (auto rit = inputs_l0.rbegin(); rit != inputs_l0.rend(); ++rit) {
+        const auto& meta = *rit;
         std::shared_ptr<SSTable> table;
         Status s = table_cache_.FindTable(meta.file_number, options_.dbname, &table);
         if (!s.ok()) return s;
@@ -307,12 +319,18 @@ Status KVDB::CompactManually() {
         table_cache_.Evict(meta.file_number);
     }
 
-    FileMetaData new_meta;
-    new_meta.file_number = new_file_number;
-    new_meta.file_size = file_size;
-    new_meta.smallest = first_key;
-    new_meta.largest = last_key;
-    version_set_->AddFile(1, new_meta);
+    // 修复:输入全是 tombstone(或空)时没有任何有效输出,此时不能 AddFile,
+    // 否则会产生 smallest/largest 为空串的 L1 文件,污染二分查找的区间假设
+    if (first) {
+        remove(sst_buf);  // 删掉空产物文件
+    } else {
+        FileMetaData new_meta;
+        new_meta.file_number = new_file_number;
+        new_meta.file_size = file_size;
+        new_meta.smallest = first_key;
+        new_meta.largest = last_key;
+        version_set_->AddFile(1, new_meta);
+    }
 
     s = version_set_->WriteSnapshot();
     if (!s.ok()) return s;

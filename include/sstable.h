@@ -13,6 +13,9 @@
 
 namespace kv {
 
+// 前向声明:头文件只持裸指针,不依赖 lru_cache.h,编译耦合最小
+class LRUCache;
+
 void EncodeFixed32(std::string* dst, uint32_t value);
 void EncodeFixed64(std::string* dst, uint64_t value);
 uint32_t DecodeFixed32(const char* ptr);
@@ -52,8 +55,12 @@ private:
 
 class SSTable {
 public:
-    static Status Open(const std::string& filename, 
-                       std::unique_ptr<SSTable>* table);
+    // file_number / block_cache 带默认值,老调用点(test_sstable.cc)不用改;
+    // TableCache 打开文件时传入真实 file_number 和共享缓存
+    static Status Open(const std::string& filename,
+                       std::unique_ptr<SSTable>* table,
+                       uint64_t file_number = 0,
+                       LRUCache* block_cache = nullptr);
 
     ~SSTable();
 
@@ -104,7 +111,8 @@ private:
     SSTable(FILE* file, const std::string& filename,
             uint64_t file_size, uint64_t num_entries,
             const std::string& smallest, const std::string& largest,
-            uint64_t index_offset, uint64_t index_size);
+            uint64_t index_offset, uint64_t index_size,
+            uint64_t file_number, LRUCache* block_cache);
 
     Status ReadAt(uint64_t offset, size_t size, std::string* result) const;
     Status FindBlock(const Slice& key, uint64_t* offset, uint64_t* size) const;
@@ -119,6 +127,9 @@ private:
     uint64_t index_size_;
     std::vector<IndexEntry> index_entries_;
 
+    uint64_t file_number_ = 0;          // BlockCache key 的高 32 位
+    LRUCache* block_cache_ = nullptr;   // 不持有所有权,owner 是 KVDB
+
     SSTable(const SSTable&) = delete;
     SSTable& operator=(const SSTable&) = delete;
 };
@@ -128,6 +139,9 @@ public:
     TableCache() = default;
     ~TableCache() = default;
 
+    // 由 KVDB 构造时调用,注入共享 BlockCache(不持有所有权)
+    void SetBlockCache(LRUCache* c) { block_cache_ = c; }
+
     Status FindTable(uint64_t file_number, const std::string& dbname,
                      std::shared_ptr<SSTable>* table);
     void Evict(uint64_t file_number);
@@ -136,6 +150,7 @@ public:
 private:
     std::mutex mutex_;
     std::unordered_map<uint64_t, std::weak_ptr<SSTable>> cache_;
+    LRUCache* block_cache_ = nullptr;
 
     TableCache(const TableCache&) = delete;
     TableCache& operator=(const TableCache&) = delete;

@@ -25,6 +25,7 @@ set(KV_SOURCES
     src/write_batch.cc
     src/wal.cc
     src/sstable.cc
+    src/lru_cache.cc
 )
 
 
@@ -42,7 +43,7 @@ add_test(NAME write_batch_test COMMAND test_write_batch)
 add_executable(test_wal tests/test_wal.cc src/wal.cc src/write_batch.cc)
 add_test(NAME wal_test COMMAND test_wal)
 
-add_executable(test_sstable tests/test_sstable.cc src/sstable.cc src/memtable.cc)
+add_executable(test_sstable tests/test_sstable.cc src/sstable.cc src/memtable.cc src/lru_cache.cc)
 target_link_libraries(test_sstable Threads::Threads)
 add_test(NAME sstable_test COMMAND test_sstable)
 
@@ -51,9 +52,13 @@ target_link_libraries(test_version_set Threads::Threads)
 add_test(NAME version_set_test COMMAND test_version_set)
 
 # 修改 test_kv_db 的依赖，加入 version_set.cc
-add_executable(test_kv_db tests/test_kv_db.cc src/kv_db.cc src/memtable.cc src/write_batch.cc src/wal.cc src/sstable.cc src/version_set.cc src/merging_iterator.cc)
+add_executable(test_kv_db tests/test_kv_db.cc src/kv_db.cc src/memtable.cc src/write_batch.cc src/wal.cc src/sstable.cc src/version_set.cc src/merging_iterator.cc src/lru_cache.cc)
 target_link_libraries(test_kv_db Threads::Threads)
 add_test(NAME kv_db_test COMMAND test_kv_db)
+
+add_executable(test_lru_cache tests/test_lru_cache.cc src/lru_cache.cc)
+target_link_libraries(test_lru_cache Threads::Threads)
+add_test(NAME lru_cache_test COMMAND test_lru_cache)
 
 add_executable(test_merging_iterator tests/test_merging_iterator.cc src/merging_iterator.cc src/memtable.cc)
 target_link_libraries(test_merging_iterator Threads::Threads)

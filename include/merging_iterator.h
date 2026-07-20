@@ -34,7 +34,9 @@ private:
                 // 最小堆：key 字典序大的优先级低（沉底）
                 return cmp > 0;
             }
-            // key 相同时，index 小的优先级更高（L0 的 iterator 先加入，index 更小）
+            // key 相同时，index 小的优先级更高(先出堆)。
+            // 调用方契约:必须按"数据新→旧"的顺序传入迭代器,
+            // 这样同 key 多版本去重时保留的就是先出堆的最新版本。
             return a.index > b.index;
         }
     };

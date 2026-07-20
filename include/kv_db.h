@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include "memtable.h"
+#include "lru_cache.h"
 #include "sstable.h"
 #include "status.h"
 #include "version_set.h"
@@ -18,6 +19,7 @@ class KVDB {
 public:
     struct Options {
         size_t write_buffer_size = 4 * 1024 * 1024;
+        size_t block_cache_capacity = 8 * 1024 * 1024;  // BlockCache 容量,0 = 关闭
         std::string dbname = "/tmp/kv_db";
     };
 
@@ -52,6 +54,10 @@ private:
     std::atomic<uint64_t> last_sequence_{1};
 
     std::unique_ptr<VersionSet> version_set_;
+    // 注意声明顺序:block_cache_ 必须在 table_cache_ 之前。
+    // KVDB 析构时成员逆序销毁,SSTable(经 TableCache 持有)引用
+    // block_cache_ 的裸指针,缓存必须比引用它的 SSTable 活得久。
+    std::unique_ptr<LRUCache> block_cache_;
     TableCache table_cache_;
 };
 

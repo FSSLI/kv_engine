@@ -63,3 +63,8 @@ add_test(NAME lru_cache_test COMMAND test_lru_cache)
 add_executable(test_merging_iterator tests/test_merging_iterator.cc src/merging_iterator.cc src/memtable.cc)
 target_link_libraries(test_merging_iterator Threads::Threads)
 add_test(NAME merging_iterator_test COMMAND test_merging_iterator)
+
+# Week 3 任务②:双 MemTable + 异步 flush
+add_executable(test_async_flush tests/test_async_flush.cc src/kv_db.cc src/memtable.cc src/write_batch.cc src/wal.cc src/sstable.cc src/version_set.cc src/merging_iterator.cc src/lru_cache.cc)
+target_link_libraries(test_async_flush Threads::Threads)
+add_test(NAME async_flush_test COMMAND test_async_flush)

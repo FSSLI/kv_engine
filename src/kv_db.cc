@@ -42,20 +42,28 @@ Status KVDB::Open(const Options& options, std::unique_ptr<KVDB>* dbptr) {
     s = db->Recover();
     if (!s.ok()) return s;
 
+    db->bg_thread_ = std::thread(&KVDB::BackgroundWork, db.get());  // ① 启动线程
+
     dbptr->reset(db.release());
     DEBUG_LOG("KVDB::Open: %s", options.dbname.c_str());
     return Status::OK();
 }
 
 KVDB::KVDB(const Options& options) : options_(options), memtable_(new SkipList()) {
-    // BlockCache:所有 SSTable 读共享一份缓存,0 表示关闭
     if (options_.block_cache_capacity > 0) {
         block_cache_.reset(new LRUCache(options_.block_cache_capacity));
         table_cache_.SetBlockCache(block_cache_.get());
     }
 }
 
-KVDB::~KVDB() = default;
+KVDB::~KVDB() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        bg_exit_ = true;
+    }
+    bg_cv_.notify_one();  // ② 你漏掉的:叫醒睡在 wait 上的后台线程
+    if (bg_thread_.joinable()) bg_thread_.join();
+}
 
 Status KVDB::OpenNewWAL() {
     uint64_t log_number = version_set_->NewFileNumber();
@@ -69,7 +77,7 @@ Status KVDB::OpenNewWAL() {
     wal_ = std::move(wal);
 
     version_set_->SetLogNumber(log_number);
-    return version_set_->WriteSnapshot();  // 新增：持久化 log_number
+    return version_set_->WriteSnapshot();
 }
 
 Status KVDB::Put(const std::string& key, const std::string& value) {
@@ -85,27 +93,53 @@ Status KVDB::Delete(const std::string& key) {
 }
 
 Status KVDB::Write(WriteBatch* batch) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
 
     if (!batch || batch->Count() == 0) {
         return Status::InvalidArgument("empty batch");
     }
 
+    Status s = MakeRoomForWrite(&lock);
+    if (!s.ok()) return s;
+
     uint64_t seq = last_sequence_.fetch_add(1);
 
-    Status s = wal_->Append(*batch, seq);
+    s = wal_->Append(*batch, seq);
     if (!s.ok()) return s;
 
     MemTableInserter inserter(memtable_.get());
     s = batch->Iterate(&inserter);
     if (!s.ok()) return s;
 
-    if (memtable_->ApproximateMemoryUsage() > options_.write_buffer_size) {
-        s = SwitchMemTable();
-        if (!s.ok()) return s;
-    }
-
     return Status::OK();
+}
+
+Status KVDB::MakeRoomForWrite(std::unique_lock<std::mutex>* lock) {
+    while (true) {
+        if (memtable_->ApproximateMemoryUsage() <= options_.write_buffer_size) {
+            return Status::OK();  // 有空间:即使 imm_ 在刷也不等
+        }
+        if (imm_ != nullptr) {
+            imm_done_cv_.wait(*lock);  // mem 满 + 后台在刷:节流
+        } else {
+            SwitchToImmutableLocked();
+            return Status::OK();
+        }
+    }
+}
+
+void KVDB::SwitchToImmutableLocked() {
+    wal_->Close();
+    uint64_t old_log = version_set_->LogNumber();
+    version_set_->SetPrevLogNumber(old_log);
+    imm_log_number_ = old_log;
+
+    imm_ = std::move(memtable_);
+    memtable_.reset(new SkipList());
+
+    Status s = OpenNewWAL();
+    if (!s.ok()) DEBUG_LOG("SwitchToImmutable: open WAL failed");  // ③ 去掉 ...
+    bg_cv_.notify_one();
 }
 
 Status KVDB::Get(const std::string& key, std::string* value) {
@@ -116,7 +150,12 @@ Status KVDB::Get(const std::string& key, std::string* value) {
         return Status::OK();
     }
 
-    // 查 SSTable：L0 从新到旧逐个查，L1+ 二分查找
+    // mem → imm → 磁盘:imm_ 比所有 SSTable 都新
+    if (imm_ != nullptr && imm_->Contains(key, value)) {
+        if (value->empty()) return Status::NotFound("key deleted");
+        return Status::OK();
+    }
+
     for (int level = 0; level < VersionSet::kMaxLevel; ++level) {
         const auto& files = version_set_->GetLevel(level);
         if (files.empty()) continue;
@@ -125,11 +164,9 @@ Status KVDB::Get(const std::string& key, std::string* value) {
             for (auto it = files.rbegin(); it != files.rend(); ++it) {
                 std::shared_ptr<SSTable> table;
                 Status s = table_cache_.FindTable(it->file_number, options_.dbname, &table);
-                // 修复:文件损坏要上报,不能静默跳过当成 NotFound
                 if (!s.ok()) return s;
                 s = table->Get(key, value);
                 if (s.ok()) {
-                    // 修复：空 value 表示 Delete 标记
                     if (value->empty()) return Status::NotFound("key deleted");
                     return Status::OK();
                 }
@@ -150,7 +187,6 @@ Status KVDB::Get(const std::string& key, std::string* value) {
                     if (!s.ok()) return s;
                     s = table->Get(key, value);
                     if (s.ok()) {
-                        // 修复：空 value 表示 Delete 标记
                         if (value->empty()) return Status::NotFound("key deleted");
                         return Status::OK();
                     }
@@ -164,14 +200,51 @@ Status KVDB::Get(const std::string& key, std::string* value) {
     return Status::NotFound("key not found");
 }
 
-Status KVDB::SwitchMemTable() {
-    uint64_t file_number = version_set_->NewFileNumber();
+void KVDB::BackgroundWork() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (true) {
+        bg_cv_.wait(lock, [this]{ return imm_ != nullptr || bg_exit_; });
+
+        if (imm_ != nullptr) {
+            uint64_t file_number = version_set_->NewFileNumber();
+            uint64_t old_log    = imm_log_number_;
+            SkipList* imm       = imm_.get();
+
+            lock.unlock();  // IO 放锁,前台 Get 可并发读 imm_
+            FileMetaData meta;
+            Status s = WriteLevel0Table(imm, file_number, &meta);
+            lock.lock();
+
+            if (s.ok()) {
+                version_set_->AddFile(0, meta);
+                version_set_->SetPrevLogNumber(0);
+                s = version_set_->WriteSnapshot();
+                if (s.ok()) {
+                    char buf[128];
+                    snprintf(buf, sizeof(buf), "%s/%06lu.log",
+                             options_.dbname.c_str(), old_log);
+                    remove(buf);
+                }
+                DEBUG_LOG("AsyncFlush done: file=%lu L0=%d",
+                          file_number, version_set_->NumLevelFiles(0));
+            } else {
+                DEBUG_LOG("AsyncFlush FAILED: file=%lu", file_number);
+            }
+            imm_.reset();
+            imm_done_cv_.notify_all();
+        }
+
+        if (bg_exit_ && imm_ == nullptr) return;
+    }
+}
+
+Status KVDB::WriteLevel0Table(SkipList* imm, uint64_t file_number, FileMetaData* meta) {
     char sst_buf[128];
     snprintf(sst_buf, sizeof(sst_buf), "%s/%06lu.sst",
              options_.dbname.c_str(), file_number);
 
     SSTableBuilder builder(sst_buf, 4096);
-    SkipList::Iterator iter(memtable_.get());
+    SkipList::Iterator iter(imm);
     iter.SeekToFirst();
 
     std::string first_key, last_key;
@@ -191,31 +264,25 @@ Status KVDB::SwitchMemTable() {
     Status s = builder.Finish(&file_size);
     if (!s.ok()) return s;
 
-    FileMetaData meta;
-    meta.file_number = file_number;
-    meta.file_size = file_size;
-    meta.smallest = first_key;
-    meta.largest = last_key;
-    version_set_->AddFile(0, meta);
-
-    s = version_set_->WriteSnapshot();
-    if (!s.ok()) return s;
-
-    wal_->Close();
-    remove(wal_filename_.c_str());
-
-    memtable_.reset(new SkipList());
-    s = OpenNewWAL();
-    if (!s.ok()) return s;
-
-    DEBUG_LOG("KVDB::SwitchMemTable: flushed to %s, L0_files=%d",
-              sst_buf, version_set_->NumLevelFiles(0));
+    meta->file_number = file_number;
+    meta->file_size = file_size;
+    meta->smallest = first_key;
+    meta->largest = last_key;
     return Status::OK();
 }
 
 Status KVDB::TEST_FlushMemTable() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return SwitchMemTable();
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (imm_ != nullptr) {
+        imm_done_cv_.wait(lock);
+    }
+    if (memtable_->ApproximateMemoryUsage() > 0) {
+        SwitchToImmutableLocked();
+        while (imm_ != nullptr) {
+            imm_done_cv_.wait(lock);
+        }
+    }
+    return Status::OK();
 }
 
 Status KVDB::CompactManually() {
@@ -226,10 +293,8 @@ Status KVDB::CompactManually() {
         return Status::OK();
     }
 
-    // 1. 收集 L0 文件
     std::vector<FileMetaData> inputs_l0 = l0_files;
 
-    // 2. 计算 L0 整体 key 范围
     std::string smallest = inputs_l0[0].smallest;
     std::string largest = inputs_l0[0].largest;
     for (size_t i = 1; i < inputs_l0.size(); ++i) {
@@ -237,7 +302,6 @@ Status KVDB::CompactManually() {
         if (inputs_l0[i].largest > largest) largest = inputs_l0[i].largest;
     }
 
-    // 3. 找 L1 重叠文件（L1 文件之间不重叠，直接遍历检查）
     std::vector<FileMetaData> inputs_l1;
     const auto& l1_files = version_set_->GetLevel(1);
     for (const auto& meta : l1_files) {
@@ -246,32 +310,26 @@ Status KVDB::CompactManually() {
         }
     }
 
-    // 4. 打开所有文件，创建 MergingIterator
-    // 注意：Iterator 内部只持有 SSTable 裸指针，必须额外保活 shared_ptr
     std::vector<std::shared_ptr<SSTable>> tables_to_keep_alive;
     std::vector<std::unique_ptr<Iterator>> iters;
 
-    // 修复(P0):L0 必须按"新→旧"顺序创建迭代器。
-    // levels_[0] 是 Append 顺序(旧文件在前),正序遍历会让最旧的 L0 文件
-    // 拿到最小 index;而 MergingIterator 在同 key 时让 index 小的先出堆,
-    // 去重保留先出堆的版本 → 旧值会"复活"。倒序后最新 L0 拿到 index 0。
+    // P0 修复:L0 按"新→旧"顺序创建迭代器
     for (auto rit = inputs_l0.rbegin(); rit != inputs_l0.rend(); ++rit) {
         const auto& meta = *rit;
         std::shared_ptr<SSTable> table;
         Status s = table_cache_.FindTable(meta.file_number, options_.dbname, &table);
         if (!s.ok()) return s;
-        tables_to_keep_alive.push_back(table);  // 保活，直到遍历结束
+        tables_to_keep_alive.push_back(table);
         iters.emplace_back(table->NewIterator());
     }
     for (const auto& meta : inputs_l1) {
         std::shared_ptr<SSTable> table;
         Status s = table_cache_.FindTable(meta.file_number, options_.dbname, &table);
         if (!s.ok()) return s;
-        tables_to_keep_alive.push_back(table);  // 保活，直到遍历结束
+        tables_to_keep_alive.push_back(table);
         iters.emplace_back(table->NewIterator());
     }
 
-    // 5. 归并输出到新的 L1 SSTable
     uint64_t new_file_number = version_set_->NewFileNumber();
     char sst_buf[128];
     snprintf(sst_buf, sizeof(sst_buf), "%s/%06lu.sst",
@@ -283,14 +341,12 @@ Status KVDB::CompactManually() {
 
     std::string first_key, last_key;
     bool first = true;
-    std::string last_output_key;  // 新增：用于同一 key 多版本去重
+    std::string last_output_key;
 
     while (merge.Valid()) {
         std::string cur_key = merge.key().ToString();
 
-        // 修复：相同 key 只保留第一个（最新版本，因为 L0 的 iterator index 更小，先出堆）
         if (cur_key != last_output_key) {
-            // Week 1 简化：空 value 视为 Delete，Compaction 时跳过
             if (merge.value().size() > 0) {
                 Status s = builder.Add(merge.key(), merge.value());
                 if (!s.ok()) return s;
@@ -309,7 +365,6 @@ Status KVDB::CompactManually() {
     Status s = builder.Finish(&file_size);
     if (!s.ok()) return s;
 
-    // 6. 更新 VersionSet
     for (const auto& meta : inputs_l0) {
         version_set_->RemoveFile(0, meta.file_number);
         table_cache_.Evict(meta.file_number);
@@ -319,10 +374,8 @@ Status KVDB::CompactManually() {
         table_cache_.Evict(meta.file_number);
     }
 
-    // 修复:输入全是 tombstone(或空)时没有任何有效输出,此时不能 AddFile,
-    // 否则会产生 smallest/largest 为空串的 L1 文件,污染二分查找的区间假设
     if (first) {
-        remove(sst_buf);  // 删掉空产物文件
+        remove(sst_buf);
     } else {
         FileMetaData new_meta;
         new_meta.file_number = new_file_number;
@@ -335,7 +388,6 @@ Status KVDB::CompactManually() {
     s = version_set_->WriteSnapshot();
     if (!s.ok()) return s;
 
-    // 7. 删除旧 SSTable 文件
     for (const auto& meta : inputs_l0) {
         char buf[128];
         snprintf(buf, sizeof(buf), "%s/%06lu.sst", options_.dbname.c_str(), meta.file_number);
@@ -357,7 +409,7 @@ Status KVDB::Recover() {
     uint64_t log_number = version_set_->LogNumber();
     uint64_t prev_log = version_set_->PrevLogNumber();
 
-    // 先重放 prev_log（如果有，对应 immutable_mem_ 的旧 WAL）
+    // 先重放 prev_log(崩溃时 imm_ 还没落盘的那个旧 WAL)
     if (prev_log > 0) {
         char buf[128];
         snprintf(buf, sizeof(buf), "%s/%06lu.log", options_.dbname.c_str(), prev_log);
@@ -365,14 +417,12 @@ Status KVDB::Recover() {
         if (!s.ok() && !s.IsNotFound()) return s;
     }
 
-    // 重放当前活跃的 WAL
     if (log_number > 0) {
         char buf[128];
         snprintf(buf, sizeof(buf), "%s/%06lu.log", options_.dbname.c_str(), log_number);
         Status s = RecoverLogFile(buf);
         if (!s.ok() && !s.IsNotFound()) return s;
 
-        // 继续追加写同一个 WAL 文件（数据安全：MemTable 里的数据仍受 WAL 保护）
         std::unique_ptr<WAL> wal;
         s = WAL::OpenForAppend(buf, &wal);
         if (!s.ok()) return s;
@@ -381,14 +431,13 @@ Status KVDB::Recover() {
         return Status::OK();
     }
 
-    // 全新数据库
     return OpenNewWAL();
 }
 
 Status KVDB::RecoverLogFile(const std::string& filename) {
     std::unique_ptr<WAL> wal;
     Status s = WAL::OpenForRead(filename, &wal);
-    if (s.IsNotFound()) return Status::OK();  // 文件不存在，正常
+    if (s.IsNotFound()) return Status::OK();
     if (!s.ok()) return s;
 
     uint64_t seq = 0;
@@ -402,7 +451,6 @@ Status KVDB::RecoverLogFile(const std::string& filename) {
         if (seq > max_seq) max_seq = seq;
     }
 
-    // 恢复序列号：下一条写入用 max_seq + 1
     last_sequence_.store(max_seq + 1);
     return Status::OK();
 }

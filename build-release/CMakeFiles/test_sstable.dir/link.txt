@@ -1,1 +1,0 @@
-/usr/bin/c++ -O2 -DNDEBUG CMakeFiles/test_sstable.dir/tests/test_sstable.cc.o CMakeFiles/test_sstable.dir/src/sstable.cc.o CMakeFiles/test_sstable.dir/src/memtable.cc.o CMakeFiles/test_sstable.dir/src/lru_cache.cc.o CMakeFiles/test_sstable.dir/src/bloom_filter.cc.o -o test_sstable 

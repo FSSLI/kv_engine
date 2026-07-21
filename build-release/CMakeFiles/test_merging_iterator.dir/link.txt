@@ -1,1 +1,0 @@
-/usr/bin/c++ -O2 -DNDEBUG CMakeFiles/test_merging_iterator.dir/tests/test_merging_iterator.cc.o CMakeFiles/test_merging_iterator.dir/src/merging_iterator.cc.o CMakeFiles/test_merging_iterator.dir/src/memtable.cc.o -o test_merging_iterator 

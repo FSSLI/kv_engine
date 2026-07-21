@@ -23,3 +23,50 @@ Thumbs.db
 *.sst
 CURRENT
 MANIFEST-*
+# === 构建产物(CTest / CMake / 编译器) ===
+build*/
+build-*/
+out/
+cmake-build-*/
+
+# CTest 临时输出(CTest --output-on-failure 产生)
+Testing/
+
+# CMake 临时/缓存
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+_deps/
+
+# Make / Ninja
+Makefile
+*.make
+*.ninja
+.ninja_*
+
+# 目标文件 / 静态库 / 动态库
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Protobuf 生成物(由 cmake 现场生成,不要提交)
+*.pb.cc
+*.pb.h
+
+# 杂
+*.log
+*.tmp
+core
+core.*
+.DS_Store
+.vscode/
+.idea/
+*.swp
+

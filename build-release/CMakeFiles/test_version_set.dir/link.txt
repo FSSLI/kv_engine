@@ -1,1 +1,0 @@
-/usr/bin/c++ -O2 -DNDEBUG CMakeFiles/test_version_set.dir/tests/test_version_set.cc.o CMakeFiles/test_version_set.dir/src/version_set.cc.o -o test_version_set 
